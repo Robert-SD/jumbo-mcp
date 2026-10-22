@@ -33,6 +33,7 @@ import {
   StatiegeldReceiptEntry,
   StatiegeldSummaryResult,
 } from "./types.js";
+import type { OrderPaymentInfo, PaymentLinkRecord } from "./payment.js";
 
 const GRAPHQL_URL = "https://www.jumbo.com/api/graphql";
 
@@ -2202,6 +2203,131 @@ export class JumboClient {
         : null,
     };
   }
+
+  /**
+   * Resolve a pay-by-link record (`PaymentLink`). The response is a success
+   * envelope with an inner `result`; `success:false` carries the reason in
+   * `code`/`error.errorMessage` and is raised, never returned as data.
+   *
+   * Client name: the link page is served by the orders app, which is also what
+   * `x-source` advertises for the other order queries.
+   */
+  async getPaymentLink(linkId: string): Promise<PaymentLinkRecord> {
+    const id = String(linkId ?? "").trim();
+    if (!id) throw new Error("getPaymentLink requires a link id.");
+    const q = `
+    query PaymentLink($input: PaymentLinkInput!) {
+      paymentLink(input: $input) {
+        success
+        code
+        error {
+          errorMessage
+        }
+        result {
+          uuid
+          status
+          result
+          url
+          paymentReference
+          amount {
+            amount
+            currency
+          }
+          retryPaymentUrl
+          description
+        }
+      }
+    }
+    `;
+    const data = await this.executeGraphql<any>(
+      q,
+      { input: { linkId: id } },
+      "JUMBO_WEB-orders"
+    );
+    const payload = data?.paymentLink;
+    if (!payload) {
+      throw new JumboApiError(
+        "PaymentLink",
+        "UNEXPECTED_RESULT",
+        "paymentLink returned no payload."
+      );
+    }
+    if (payload.success === false) {
+      throw new JumboApiError(
+        "PaymentLinkError",
+        payload.code ?? "UNKNOWN",
+        payload.error?.errorMessage ??
+          `Jumbo rejected the payment-link lookup (${payload.code ?? "unknown"}).`
+      );
+    }
+    const r = payload.result;
+    if (!r) {
+      throw new JumboApiError(
+        "PaymentLink",
+        "UNEXPECTED_RESULT",
+        "paymentLink returned no result."
+      );
+    }
+    return {
+      link_id: r.uuid ?? id,
+      status: r.status ?? null,
+      result: r.result ?? null,
+      url: r.url ?? null,
+      retry_url: r.retryPaymentUrl ?? null,
+      payment_reference: r.paymentReference ?? null,
+      description: r.description ?? null,
+      amount:
+        r.amount?.amount != null
+          ? { amount: r.amount.amount, currency: r.amount.currency ?? "EUR" }
+          : null,
+    };
+  }
+
+  /**
+   * Read an order's payment handle: `paymentLink { url isAuthorized }`. The
+   * `isAuthorized` flag is the settlement cross-check — it advances from the PSP
+   * webhook, while the link entity may only advance when a browser lands on the
+   * result page.
+   *
+   * `orderId` is a Float in Jumbo's schema, not an ID. `$orderChannel` and
+   * `$customerId` are declared by the web document but unused in its body, and
+   * Apollo strips unused variables before sending — declaring them here would
+   * earn a GRAPHQL_VALIDATION_FAILED.
+   */
+  async getOrderPayment(orderId: string | number): Promise<OrderPaymentInfo> {
+    const id = Number(orderId);
+    if (!Number.isFinite(id) || id <= 0) {
+      throw new Error("getOrderPayment requires a positive numeric order id.");
+    }
+    const q = `
+    query OrderPayment($orderId: Float!, $mergeItemsWithSameSkuAndPrice: Boolean! = true) {
+      order(orderId: $orderId, options: {mergeItemsWithSameSkuAndPrice: $mergeItemsWithSameSkuAndPrice}) {
+        orderId
+        fulfilmentType
+        paymentMethod
+        paymentLink {
+          url
+          isAuthorized
+        }
+      }
+    }
+    `;
+    const data = await this.executeGraphql<any>(q, { orderId: id }, "JUMBO_WEB-orders");
+    const order = data?.order;
+    if (!order) {
+      throw new JumboApiError("OrderPayment", "NOT_FOUND", `No order found for orderId ${id}.`);
+    }
+    return {
+      order_id: order.orderId != null ? String(order.orderId) : String(id),
+      fulfilment_type: order.fulfilmentType ?? null,
+      payment_method: order.paymentMethod ?? null,
+      pay_url: order.paymentLink?.url ?? null,
+      is_authorized:
+        typeof order.paymentLink?.isAuthorized === "boolean"
+          ? order.paymentLink.isAuthorized
+          : null,
+    };
+  }
 }
 
 /** Receipt terms are compared lowercase, trimmed, ignoring the printed promo marker. */
@@ -2269,7 +2395,7 @@ async function resolveCoordinates(
         CACHE_TTL.geocode,
         async () => {
           const res = await fetch(geoUrl, {
-            headers: { "User-Agent": "jumbo-mcp/0.4.0" },
+            headers: { "User-Agent": "jumbo-mcp/0.5.0" },
           });
           // A failed lookup must not be cached: an empty result would look
           // like "no coordinates" and silently pin the fallback for 24 hours.

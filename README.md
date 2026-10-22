@@ -1,7 +1,7 @@
 # Jumbo MCP Server
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-0.4.0-green.svg)](https://modelcontextprotocol.io/)
+[![MCP](https://img.shields.io/badge/MCP-0.5.0-green.svg)](https://modelcontextprotocol.io/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg)](https://www.typescriptlang.org/)
 
 A Model Context Protocol (MCP) server for **Jumbo Supermarkten**.
@@ -144,7 +144,92 @@ Run with `JUMBO_REFRESH_TOKEN`:
 | `jumbo_get_deposits` | Statiegeld for one order: catalogue plus deposits returned. | `order_id` (required) |
 | `jumbo_get_statiegeld_summary` | Statiegeld totals: returned, charged, and net balance across receipts in a date range or year. | `year`, `start_date`, `end_date`, `max_receipts` (`50`) |
 | `jumbo_get_stamps` | Digital stamps, active saving (spaar) campaigns, buying-stamps balance. | None |
+| `jumbo_get_payment_link` | Pay-by-link hand-off for an unpaid order: state, amount, pay URL, retry URL and a ready-to-send message. | `order_id`, `link_id`, `attempt` (all optional; one of the first two required) |
+| `jumbo_payment_status` | Reconcile whether the payment settled: `AWAITING_PAYMENT` / `PROCESSING` / `PAID` / `FAILED` / `EXPIRED`. | `link_id`, `order_id`, `attempt` (all optional; one of the first two required) |
 | `jumbo_cache_stats` | Combined counters for the response and geocoding caches: enabled, hits, misses, hit rate, entries, evictions. | None |
+
+---
+
+## Pay-by-Link Hand-off
+
+Jumbo's checkout is Adyen-hosted: `createPaymentSession` returns `sessionData` +
+`sessionId`, the browser mounts Adyen Web **on jumbo.com's own origin**, and the
+`returnUrl` is built from `window.location.origin`. The Adyen client key is
+origin-restricted, so the SDK cannot be mounted anywhere else. No MCP process can
+therefore *complete* a payment — the only supported design is to hand the person a
+URL and reconcile the outcome from Jumbo's own records. Two read-only tools do
+exactly that.
+
+**`jumbo_get_payment_link`** resolves an unpaid order into an envelope:
+
+```json
+{
+  "state": "AWAITING_PAYMENT",
+  "settled": false,
+  "settled_source": "order.paymentLink.isAuthorized",
+  "order_id": "4821337",
+  "link_id": "8f2c1d3e-9a44-4a2b-9f31-6c1d7b2a4e55",
+  "amount": { "amount": 6845, "currency": "EUR" },
+  "payment_reference": "PAY-9F31-88213",
+  "pay_url": "https://www.jumbo.com/service/betalen/8f2c1d3e-…",
+  "retry_url": null,
+  "expires_at": null,
+  "poll_after_seconds": 30,
+  "poll_budget_seconds": 2700,
+  "link_status": "ACTIVE",
+  "link_result": null,
+  "degraded": [],
+  "forward": {
+    "message": "Jumbo — payment needed\n€ 68,45 · order 4821337\nhttps://www.jumbo.com/service/betalen/8f2c1d3e-…\nI'll confirm with Jumbo's API — no need to reply.",
+    "dm_only": true,
+    "unfurl_links": false,
+    "unfurl_media": false
+  }
+}
+```
+
+Forward `forward.message` verbatim and honour the three transport fields:
+
+- **Direct message only** — a pay page posted in a channel is a public link, and
+  its preview leaks the amount and order contents.
+- **Link unfurling off** (`unfurl_links`/`unfurl_media`) — otherwise the platform
+  crawls the payment page on the person's behalf.
+- **Raw URL as text**, never a button or card block: it has to survive
+  copy-paste onto a phone, where the bank app lives.
+
+**`jumbo_payment_status`** reconciles the outcome on the same envelope, with
+`forward` always `null`. The state machine has four working states:
+
+| `link.status` / `link.result` | Envelope state | Meaning |
+| :--- | :--- | :--- |
+| `result: Authorised`, or `isAuthorized: true` | `PAID` | terminal |
+| `result: Received` or `Pending` | `PROCESSING` | keep polling; never a success |
+| `result: Cancelled` / `Refused` / `Error` | `FAILED` | offer `retry_url` |
+| `status: EXPIRED` | `EXPIRED` | terminal; re-issuing needs a fresh slot |
+
+Poll again after `poll_after_seconds` (30 s for the first ten attempts, then
+120 s) and stop at a terminal state or after `JUMBO_MCP_PAYLINK_BUDGET_SECONDS`
+(default 45 minutes). Every read also cross-checks the order's own
+`paymentLink.isAuthorized` flag: it advances from the PSP webhook, while the link
+entity may only advance when a browser lands on the result page. Two sources for
+one reason — the cross-check is what keeps a headless hand-off honest.
+
+**Never** mark a payment complete because the person said they paid. Only a
+vendor result code or the settlement flag read back from the API counts. The URL
+is never logged, never persisted, and never returned once the state is terminal.
+
+Safety rails: URLs are forwarded only when they are `https` and on
+`jumbo.com`/`adyen.com` (override with `JUMBO_MCP_PAY_URL_HOSTS`); anything else
+is withheld and reported in `degraded`. `retry_url` is exposed only while the
+state is `FAILED`. A supplied `link_id` that contradicts the order's own pay link
+is rejected rather than merged — by id when both sides expose one, otherwise by
+comparing the two pay URLs once the link is in hand. When neither record exposes a
+comparable URL the pair is flagged in `degraded`, never merged silently: reporting
+one payment's settlement flag against another payment's URL is how a stale id
+turns into a false `PAID`.
+`JUMBO_MCP_PAYLINK=off` removes both tools entirely, leaving the read-only
+toolset untouched. Neither tool places an order, cancels one, or accepts card
+data.
 
 ---
 
@@ -194,8 +279,6 @@ make the assistant re-add an item you just added.
   geocoding cache, so a store search that reused coordinates is visible. `npm run status` prints the cache *configuration* (enabled
   state and size cap) — it starts a separate process, so it cannot show the
   running server's counters.
-
----
 
 ---
 

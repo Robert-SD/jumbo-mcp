@@ -1,6 +1,6 @@
 {
   "name": "jumbo-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Model Context Protocol (MCP) server for Jumbo Supermarkten - Digital receipts, loyalty points, and grocery management",
   "main": "dist/index.js",
   "bin": {

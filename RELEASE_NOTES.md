@@ -1,5 +1,15 @@
 # Jumbo MCP Server Release Notes
 
+## What's New in v0.5.0 — Pay-by-Link Hand-off
+
+### 1. Two New Read-Only Tools for Unpaid Orders
+* **`jumbo_get_payment_link`**: Resolves an order (`OrderPayment`) and its pay-by-link record (`PaymentLink`) into one envelope — state, amount, payment reference, pay URL, retry URL, poll interval, and a ready-to-send `forward` block carrying the DM-only/unfurl-off transport rules.
+* **`jumbo_payment_status`**: Reconciles the same envelope without the forward block, mapping Jumbo's `status`/`result` codes and the order's `paymentLink.isAuthorized` settlement flag onto `AWAITING_PAYMENT`, `PROCESSING`, `PAID`, `FAILED` or `EXPIRED`.
+* **Why a hand-off and not a charge**: the pay page is Adyen Web mounted on jumbo.com's own origin with an origin-restricted client key and a `returnUrl` derived from `window.location.origin`, so no MCP process can complete a payment. The server prepares the URL and reconciles the outcome; the person pays.
+* **Degradation instead of failure**: when only one of the two records answers — no link id in the pay URL, or a failing link read — the envelope is still built and the reason is reported in `degraded`.
+* **Safety rails**: forwarded URLs must be `https` on `jumbo.com`/`adyen.com` (override with `JUMBO_MCP_PAY_URL_HOSTS`); off-allowlist URLs are withheld. `JUMBO_MCP_PAYLINK=off` removes both tools. Poll policy: 30 s for the first ten attempts, then 120 s, budget `JUMBO_MCP_PAYLINK_BUDGET_SECONDS` (default 45 min). `PROCESSING` is never reported as success, and no tool accepts, reads or forwards card data.
+* **Not included**: order placement, checkout, cancellation and any payment mutation. This release adds no write path.
+
 ## What's New in v0.4.0
 
 ### 1. Response Cache with a Documented Freshness Policy

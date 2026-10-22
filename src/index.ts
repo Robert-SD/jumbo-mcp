@@ -12,7 +12,7 @@ import {
   JumboClient,
   JumboShoppingListError,
 } from "./client.js";
-import {
+import { buildEnvelope, parseLinkIdFromUrl, samePayUrl } from "./payment.js";import {
   decodeJwtPayload,
   getTokensFilePath,
   loadTokens,
@@ -109,13 +109,94 @@ async function showStatus(): Promise<void> {
 }
 
 /**
+ * Resolve a pay-by-link envelope from either handle. The link record is the
+ * richer source (amount, reference, retry URL); the order record is the
+ * settlement cross-check. A failure on one is not fatal when the other answered —
+ * the reason lands in `degraded` instead of aborting the whole call. The one
+ * exception is a `link_id` that contradicts the order's own pay link: two
+ * different payments must never be merged into one envelope.
+ */
+async function resolvePaymentEnvelope(input: {
+  order_id?: number;
+  link_id?: string;
+  attempt?: number;
+}): Promise<ReturnType<typeof buildEnvelope>> {
+  if (input.order_id == null && !input.link_id) {
+    throw new Error("Provide an order_id or a link_id.");
+  }
+
+  const degraded: string[] = [];
+
+  let order: Awaited<ReturnType<typeof client.getOrderPayment>> | null = null;
+  if (input.order_id != null) {
+    try {
+      order = await client.getOrderPayment(input.order_id);
+    } catch (error: any) {
+      // The link record can still answer on its own; without one, nothing can.
+      if (!input.link_id) throw error;
+      degraded.push(`Order lookup failed: ${error.message}`);
+    }
+  }
+
+  const orderLinkId = order?.pay_url ? parseLinkIdFromUrl(order.pay_url) : null;
+  if (input.link_id && orderLinkId && input.link_id.toLowerCase() !== orderLinkId.toLowerCase()) {
+    // Merging them would report the order's settlement flag against a different
+    // payment — i.e. "PAID" for a link that was never paid.
+    throw new Error(
+      `link_id ${input.link_id} does not match the pay link of order ${order!.order_id}.`
+    );
+  }
+
+  let linkId = input.link_id ?? null;
+  if (!linkId && order?.pay_url) {
+    linkId = orderLinkId;
+    if (!linkId) {
+      degraded.push(
+        "The order's pay URL carries no link id, so the link record could not be read; state comes from the order only."
+      );
+    }
+  }
+
+  let link: Awaited<ReturnType<typeof client.getPaymentLink>> | null = null;
+  if (linkId) {
+    try {
+      link = await client.getPaymentLink(linkId);
+    } catch (error: any) {
+      if (!order) throw error;
+      degraded.push(`Payment-link lookup failed: ${error.message}`);
+    }
+  }
+
+  // The id check above only runs when both sides expose a UUID. An opaque PSP URL,
+  // or an order without a paymentLink, leaves the pair unverified — and an
+  // unverified pair is precisely how one payment's settlement flag gets reported
+  // against another payment's URL. Compare the URLs once the link is in hand, and
+  // say so when they cannot be compared at all.
+  if (order && link && !orderLinkId) {
+    const same = samePayUrl(link.url, order.pay_url);
+    if (same === false) {
+      throw new Error(
+        `link ${link.link_id} belongs to a different payment than order ${order.order_id}.`
+      );
+    }
+    if (same === null) {
+      degraded.push(
+        `Could not verify that link ${link.link_id} belongs to order ${order.order_id}: neither record exposes a comparable pay URL.`
+      );
+    }
+  }
+
+  return buildEnvelope({ order, link, attempt: input.attempt ?? 0, degraded });
+}
+
+/**
  * Build the MCP server with all tools registered. Exported so tests can drive
  * the real handler over an in-memory transport.
  */
 export function createServer(): McpServer {
   const server = new McpServer({
     name: "jumbo-mcp",
-    version: "0.4.0",
+    version: "0.5.0",
   });
 
   // Tool: Login (Agent auth verification)
@@ -568,7 +649,7 @@ export function createServer(): McpServer {
               "Mines recent receipts for purchase frequency, resolves each frequent item to a current " +
               "assortment product, and reports the offer price (was/now), discount, promo type, validity " +
               "window and unit price for everything currently promoted. Read-only: no writes, no basket, " +
-              "no checkout, no order or payment operations.", annotations: { readOnlyHint: true }, inputSchema: z.object({
+              "no checkout, no order placement; payment is limited to the read-only pay-by-link hand-off.", annotations: { readOnlyHint: true }, inputSchema: z.object({
               days: z
                 .number()
                 .int()
@@ -616,6 +697,104 @@ export function createServer(): McpServer {
     }
   });
 
+  // ---------------------------------------------------------------- payments
+  // The pay page is hosted by Jumbo/Adyen on Jumbo's own origin, with an
+  // origin-restricted PSP client key, so this server can prepare and reconcile a
+  // payment but never complete one. These two tools are the whole surface: hand a
+  // URL out, then read the outcome back. They stay read-only — no checkout, no
+  // order placement, no card data.
+  if (process.env.JUMBO_MCP_PAYLINK !== "off") {
+    server.registerTool(
+      "jumbo_get_payment_link",
+      {
+        title: "Get Jumbo Payment Link",
+        description:
+          "Resolve the pay-by-link hand-off for an unpaid Jumbo order: returns an envelope with " +
+          "state, amount, pay URL, retry URL, poll interval and (`forward`) a ready-to-send message " +
+          "with the transport rules (direct message only, link unfurling disabled, raw URL as text). " +
+          "Use it when an order exists but has not been paid, and forward `forward.message` verbatim. " +
+          "Read-only: it cannot pay, place or cancel anything. Supply order_id (preferred) or link_id.",
+        annotations: { readOnlyHint: true },
+        inputSchema: z.object({
+          order_id: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Jumbo order id (numeric, as returned by the orders list)"),
+          link_id: z
+            .string()
+            .min(8)
+            .max(120)
+            .optional()
+            .describe("Payment link UUID, when it is already known"),
+          attempt: z
+            .number()
+            .int()
+            .min(0)
+            .max(500)
+            .optional()
+            .describe("Poll attempt counter; picks the next poll interval"),
+        }),
+      },
+      async ({ order_id, link_id, attempt }) => {
+        try {
+          const envelope = await resolvePaymentEnvelope({ order_id, link_id, attempt });
+          return { content: [{ type: "text", text: JSON.stringify(envelope, null, 2) }] };
+        } catch (error: any) {
+          return toolError(error);
+        }
+      }
+    );
+
+    server.registerTool(
+      "jumbo_payment_status",
+      {
+        title: "Get Jumbo Payment Status",
+        description:
+          "Reconcile whether an order's payment settled: reads the payment link's status/result and " +
+          "the order's paymentLink.isAuthorized settlement flag, and maps them to AWAITING_PAYMENT, " +
+          "PROCESSING, PAID, FAILED or EXPIRED. Poll again after `poll_after_seconds` until the state " +
+          "is terminal; PROCESSING is never a success. Never treat a claim that the person paid as " +
+          "confirmation. Read-only. Supply link_id (preferred) or order_id.",
+        annotations: { readOnlyHint: true },
+        inputSchema: z.object({
+          link_id: z
+            .string()
+            .min(8)
+            .max(120)
+            .optional()
+            .describe("Payment link UUID from jumbo_get_payment_link"),
+          order_id: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Jumbo order id, used for the settlement cross-check"),
+          attempt: z
+            .number()
+            .int()
+            .min(0)
+            .max(500)
+            .optional()
+            .describe("Poll attempt counter; picks the next poll interval"),
+        }),
+      },
+      async ({ link_id, order_id, attempt }) => {
+        try {
+          const envelope = await resolvePaymentEnvelope({ order_id, link_id, attempt });
+          // Reconciliation does not re-send the hand-off block.
+          return {
+            content: [
+              { type: "text", text: JSON.stringify({ ...envelope, forward: null }, null, 2) },
+            ],
+          };
+        } catch (error: any) {
+          return toolError(error);
+        }
+      }
+    );
+  }
   return server;
 }
 
