@@ -57,18 +57,25 @@ function toolError(error: any) {
 }
 
 async function showStatus(): Promise<void> {
-  let tokens = loadTokens();
+  let tokens = await loadTokens();
   if (!tokens && process.env.JUMBO_REFRESH_TOKEN) {
+    // Bootstrap: the only moment JUMBO_REFRESH_TOKEN is authoritative. The
+    // rotated token it yields is only useful if it lands on disk, so a failed
+    // write/refresh is reported, never swallowed.
     try {
       tokens = await refreshTokens();
-    } catch {
-      // Ignore
+    } catch (error: any) {
+      console.error(`⚠️ Bootstrap from JUMBO_REFRESH_TOKEN failed: ${error.message}`);
     }
   }
   if (!tokens) {
     console.log("❌ Not logged in. No tokens found.");
     console.log(`Expected tokens at: ${getTokensFilePath()}`);
     console.log("\nRun 'npx jumbo-mcp login' or set JUMBO_REFRESH_TOKEN.");
+    console.log(
+      "In a container, also set JUMBO_TOKENS_FILE to a writable path on a persistent volume " +
+        "(the env token is bootstrap-only; the rotated token must be persisted)."
+    );
     return;
   }
 

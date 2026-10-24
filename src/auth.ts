@@ -5,8 +5,24 @@ import * as path from "node:path";
 import * as readline from "node:readline/promises";
 import { exec } from "node:child_process";
 import * as https from "node:https";
-import { fileURLToPath } from "node:url";
 import { TokensData, PkceSession } from "./types.js";
+import {
+  JumboAuthError,
+  getTokensFilePath,
+  getSessionFilePath,
+  TOKENS_FILE_ENV_VAR,
+  getTokenStore,
+  loadTokens,
+  saveTokens,
+  assertTokensPathWritable,
+  resolveRefreshToken,
+  TokenStore,
+  FileTokenStore,
+  MemoryTokenStore,
+  HttpTokenStore,
+} from "./token-store.js";
+
+export * from "./token-store.js";
 
 export const AUTH_CONFIG = {
   domain: "auth.jumbo.com",
@@ -30,20 +46,6 @@ export const DEFAULT_SCOPE = "openid profile email offline_access";
  */
 export const CUSTOMER_ID_CLAIM = "https://jumbo.com/customerId";
 
-/**
- * Raised when the stored Jumbo session cannot be used or renewed. `code` lets
- * callers distinguish "we never had a usable session" from "Jumbo rejected the
- * token we sent", instead of leaking raw upstream GraphQL text.
- */
-export class JumboAuthError extends Error {
-  readonly code: string;
-
-  constructor(code: string, message: string) {
-    super(message);
-    this.name = "JumboAuthError";
-    this.code = code;
-  }
-}
 
 /**
  * Guard a freshly minted access token. A refresh that succeeds at Auth0 can
@@ -81,46 +83,7 @@ export function assertUsableAccessToken(accessToken: string): void {
   }
 }
 
-export function getProjectDir(): string {
-  try {
-    const here = path.dirname(fileURLToPath(import.meta.url));
-    const candidate = path.resolve(here, "..");
-    if (fs.existsSync(path.join(candidate, "package.json"))) {
-      return candidate;
-    }
-  } catch {
-    // Ignore
-  }
-  return process.cwd();
-}
 
-export function getTokensFilePath(): string {
-  const envPath = process.env.JUMBO_TOKENS_FILE;
-  if (envPath) return path.resolve(envPath.replace(/^~/, os.homedir()));
-
-  // 1. Primary: tokens.json in project root
-  const projectFile = path.join(getProjectDir(), "tokens.json");
-  if (fs.existsSync(projectFile)) return projectFile;
-
-  // 2. Working directory tokens.json
-  const cwdFile = path.resolve(process.cwd(), "tokens.json");
-  if (fs.existsSync(cwdFile)) return cwdFile;
-
-  // 3. Fallback to global config (~/.config/jumbo-mcp/tokens.json) if it exists
-  const globalConfig = path.join(os.homedir(), ".config", "jumbo-mcp", "tokens.json");
-  if (fs.existsSync(globalConfig)) return globalConfig;
-
-  // 4. Fallback to legacy path if present
-  const legacy = path.join(os.homedir(), ".gemini", "config", "jumbo-mcp", "tokens.json");
-  if (fs.existsSync(legacy)) return legacy;
-
-  return projectFile;
-}
-
-export function getSessionFilePath(): string {
-  const baseDir = path.dirname(getTokensFilePath());
-  return path.join(baseDir, ".pkce_session.json");
-}
 
 function base64url(buffer: Buffer): string {
   return buffer.toString("base64url");
@@ -154,33 +117,6 @@ export function decodeJwtPayload(jwtStr: string): Record<string, any> {
   }
 }
 
-export function loadTokens(): TokensData | null {
-  const filePath = getTokensFilePath();
-  if (fs.existsSync(filePath)) {
-    try {
-      const content = fs.readFileSync(filePath, "utf-8");
-      return JSON.parse(content);
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-export function saveTokens(tokens: TokensData): void {
-  try {
-    const filePath = getTokensFilePath();
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, JSON.stringify(tokens, null, 2), "utf-8");
-    try {
-      fs.chmodSync(filePath, 0o600);
-    } catch {
-      // Ignore permissions failure on Windows
-    }
-  } catch {
-    // Ignore if running in a read-only environment
-  }
-}
 
 export function buildAuthorizeUrl(
   scope: string = "openid profile email offline_access"
@@ -229,10 +165,14 @@ export function buildAuthorizeUrl(
  * that fails (e.g. EBADF in Node 26 on Darwin during child process cleanup),
  * falls back to node:https, and finally to system curl to guarantee success.
  */
-async function authFetch(
+export async function authFetch(
   urlStr: string,
-  options: { method: string; headers: Record<string, string>; body?: string }
+  options: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal }
 ): Promise<{ ok: boolean; status: number; text: () => Promise<string>; json: () => Promise<any> }> {
+  if (options.signal?.aborted) {
+    throw options.signal.reason || new Error("The operation was aborted");
+  }
+
   let lastErr: any = null;
 
   // 1. Try global fetch (with quick retry on transient socket errors, except EBADF)
@@ -241,6 +181,9 @@ async function authFetch(
       return await fetch(urlStr, options);
     } catch (err: any) {
       lastErr = err;
+      if (options.signal?.aborted) {
+        throw options.signal.reason || err;
+      }
       const isEbadf =
         err?.message?.includes("EBADF") ||
         err?.cause?.code === "EBADF" ||
@@ -248,6 +191,10 @@ async function authFetch(
       if (isEbadf) break; // Don't retry broken socket in undici, switch to fallbacks immediately
       await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
     }
+  }
+
+  if (options.signal?.aborted) {
+    throw options.signal.reason || lastErr;
   }
 
   // 2. Try node:https with isolated agent (keepAlive disabled)
@@ -267,11 +214,31 @@ async function authFetch(
           method: options.method || "POST",
           headers: reqHeaders,
           agent,
+          signal: options.signal,
         },
         (res) => {
           const chunks: Buffer[] = [];
+          const onAbort = () => {
+            res.destroy(options.signal?.reason || new Error("The operation was aborted"));
+          };
+          if (options.signal) {
+            if (options.signal.aborted) {
+              return reject(options.signal.reason || new Error("The operation was aborted"));
+            }
+            options.signal.addEventListener("abort", onAbort, { once: true });
+          }
+
           res.on("data", (c) => chunks.push(c));
+          res.on("error", (e) => {
+            if (options.signal) {
+              options.signal.removeEventListener("abort", onAbort);
+            }
+            reject(e);
+          });
           res.on("end", () => {
+            if (options.signal) {
+              options.signal.removeEventListener("abort", onAbort);
+            }
             const body = Buffer.concat(chunks).toString("utf-8");
             resolve({
               ok: (res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300,
@@ -288,6 +255,13 @@ async function authFetch(
     });
   } catch (httpsErr: any) {
     lastErr = httpsErr;
+    if (options.signal?.aborted) {
+      throw options.signal.reason || httpsErr;
+    }
+  }
+
+  if (options.signal?.aborted) {
+    throw options.signal.reason || lastErr;
   }
 
   // 3. Fallback to system curl (runs in isolated process, immune to parent libuv descriptor issues)
@@ -405,7 +379,7 @@ export async function exchangeCode(
   tokens.client_id = clientId;
 
   if (opts.save) {
-    saveTokens(tokens);
+    await saveTokens(tokens);
   }
 
   if (fs.existsSync(sessPath)) {
@@ -419,68 +393,145 @@ export async function exchangeCode(
   return tokens;
 }
 
-export async function refreshTokens(existing?: TokensData): Promise<TokensData> {
-  const tokens = existing || loadTokens();
-  const rToken = tokens?.refresh_token || process.env.JUMBO_REFRESH_TOKEN;
+/**
+ * Turn an Auth0 rejection into an operator diagnosis. A rotated-away refresh
+ * token is a permanent condition (reuse detection has already invalidated the
+ * family), so the message must say that no retry can help and name the exact
+ * remediation: re-login, new env bootstrap value, and a persistent tokens file.
+ */
+function describeRefreshFailure(status: number, errText: string): Error {
+  let error: string | undefined;
+  let description: string | undefined;
+  try {
+    const parsed = JSON.parse(errText);
+    if (typeof parsed?.error === "string") error = parsed.error;
+    if (typeof parsed?.error_description === "string") description = parsed.error_description;
+  } catch {
+    // Non-JSON body: the raw text is all we have.
+  }
 
-  if (!rToken) {
-    throw new JumboAuthError(
-      "MISSING_REFRESH_TOKEN",
-      "No Jumbo refresh_token is available, so the session cannot be renewed. Run " +
-        "'jumbo-mcp login' to re-authenticate, and set JUMBO_REFRESH_TOKEN from that " +
-        "login for headless deployments."
+  if (error === "invalid_grant" || /invalid_grant|Unknown or invalid refresh token/i.test(errText)) {
+    const detail = (description || errText).replace(/[\s.]+$/, "");
+    return new JumboAuthError(
+      "REFRESH_TOKEN_REJECTED",
+      `Auth0 token refresh failed (${status}, invalid_grant): ${detail}. The stored Jumbo refresh ` +
+        `token is dead: Jumbo's Auth0 tenant rotates refresh tokens and detects reuse, so once a ` +
+        `rotated token is not persisted (or the env token is replayed after a restart) the whole ` +
+        `token family is invalidated and no retry can recover it. Tokens path: ` +
+        `${getTokensFilePath()}. Operator action: run 'jumbo-mcp login' again, set ` +
+        `JUMBO_REFRESH_TOKEN from that login (bootstrap value only), and for a container set ` +
+        `${TOKENS_FILE_ENV_VAR} to a writable path on a persistent volume ` +
+        `(for example ${TOKENS_FILE_ENV_VAR}=/data/tokens.json) so the rotated token survives a restart.`
     );
   }
 
-  const domain = tokens?.domain || AUTH_CONFIG.domain;
-  const clientId = tokens?.client_id || AUTH_CONFIG.client_id;
-  const tokenUrl = `https://${domain}/oauth/token`;
+  return new JumboAuthError(
+    "REFRESH_FAILED",
+    `Auth0 token refresh failed (${status}): ${errText} (tokens path: ${getTokensFilePath()})`
+  );
+}
 
-  // `audience` and `scope` are REQUIRED here. Auth0 mints the refreshed access
-  // token for the client's default audience when `audience` is omitted, and the
-  // 'https://jumbo.com/customerId' claim is only attached to the Jumbo web API
-  // audience -- so an audience-less refresh returns a token Jumbo rejects with
-  // "Customer ID cannot be null or empty". (auth0-spa-js spreads the stored
-  // authorization params, including audience + scope, into this grant.)
-  const payload = {
-    grant_type: "refresh_token",
-    client_id: clientId,
-    refresh_token: rToken,
-    audience: AUTH_CONFIG.audience,
-    scope: DEFAULT_SCOPE,
+let inflightRefresh: Promise<TokensData> | null = null;
+
+export async function refreshTokens(existing?: TokensData): Promise<TokensData> {
+  const store = getTokenStore();
+  const initialTokens = existing || (await loadTokens());
+  const initialRefreshToken = initialTokens?.refresh_token;
+  const initialSavedAt = initialTokens?.saved_at;
+
+  const doRefresh = async (ctx?: { waited?: boolean }): Promise<TokensData> => {
+    const tokens = (await loadTokens()) || initialTokens || null;
+    const { token: rToken } = resolveRefreshToken(tokens);
+
+    // Coalesce concurrent refreshes: if another process or thread refreshed the token
+    // while we waited for the lock, reuse the fresh token rather than hitting Auth0 twice
+    // (which would trigger reuse detection).
+    if (ctx?.waited) {
+      const tokenChanged = Boolean(
+        tokens &&
+          ((initialRefreshToken && tokens.refresh_token !== initialRefreshToken) ||
+            (initialSavedAt && tokens.saved_at !== initialSavedAt))
+      );
+      if (tokenChanged && tokens?.access_token) {
+        return tokens;
+      }
+    }
+
+    if (!rToken) {
+      throw new JumboAuthError(
+        "MISSING_REFRESH_TOKEN",
+        `No Jumbo refresh_token is available (nothing usable in ${getTokensFilePath()} and no ` +
+          `JUMBO_REFRESH_TOKEN is set), so the session cannot be renewed. Run 'jumbo-mcp login' ` +
+          `to re-authenticate; for a container, persist the tokens file on a mounted volume via ` +
+          `${TOKENS_FILE_ENV_VAR} instead of relying on the env bootstrap value alone.`
+      );
+    }
+
+    await assertTokensPathWritable();
+
+    const domain = tokens?.domain || AUTH_CONFIG.domain;
+    const clientId = tokens?.client_id || AUTH_CONFIG.client_id;
+    const tokenUrl = `https://${domain}/oauth/token`;
+
+    // `audience` and `scope` are REQUIRED here. Auth0 mints the refreshed access
+    // token for the client's default audience when `audience` is omitted, and the
+    // 'https://jumbo.com/customerId' claim is only attached to the Jumbo web API
+    // audience -- so an audience-less refresh returns a token Jumbo rejects with
+    // "Customer ID cannot be null or empty". (auth0-spa-js spreads the stored
+    // authorization params, including audience + scope, into this grant.)
+    const payload = {
+      grant_type: "refresh_token",
+      client_id: clientId,
+      refresh_token: rToken,
+      audience: AUTH_CONFIG.audience,
+      scope: DEFAULT_SCOPE,
+    };
+
+    const resp = await authFetch(tokenUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw describeRefreshFailure(resp.status, errText);
+    }
+
+    const fresh = (await resp.json()) as Partial<TokensData>;
+
+    // Validate before persisting: never overwrite a good session with a token
+    // Jumbo will reject.
+    assertUsableAccessToken(fresh.access_token || "");
+
+    const merged: TokensData = {
+      ...(tokens || {}),
+      ...fresh,
+      refresh_token: fresh.refresh_token || rToken || tokens?.refresh_token,
+      access_token: fresh.access_token || tokens?.access_token || "",
+      saved_at: new Date().toISOString(),
+      domain,
+      client_id: clientId,
+    };
+
+    await saveTokens(merged);
+    return merged;
   };
 
-  const resp = await authFetch(tokenUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!resp.ok) {
-    const errText = await resp.text();
-    throw new Error(`Auth0 token refresh failed (${resp.status}): ${errText}`);
+  if (store.withLock) {
+    return await store.withLock(doRefresh);
   }
 
-  const fresh = (await resp.json()) as Partial<TokensData>;
-
-  // Validate before persisting: never overwrite a good session with a token
-  // Jumbo will reject.
-  assertUsableAccessToken(fresh.access_token || "");
-
-  const merged: TokensData = {
-    ...(tokens || {}),
-    ...fresh,
-    access_token: fresh.access_token || tokens?.access_token || "",
-    saved_at: new Date().toISOString(),
-    domain,
-    client_id: clientId,
-  };
-
-  saveTokens(merged);
-  return merged;
+  if (!inflightRefresh) {
+    inflightRefresh = doRefresh().finally(() => {
+      inflightRefresh = null;
+    });
+  }
+  return await inflightRefresh;
 }
 
 export async function getValidAccessToken(
@@ -496,9 +547,9 @@ export async function getValidAccessToken(
     }
   }
 
-  const tokens = loadTokens();
+  const tokens = await loadTokens();
   let accessToken = tokens?.access_token;
-  const refreshToken = tokens?.refresh_token || process.env.JUMBO_REFRESH_TOKEN;
+  const { token: refreshToken } = resolveRefreshToken(tokens);
 
   if (!accessToken && !refreshToken) return null;
 
