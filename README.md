@@ -44,7 +44,7 @@ Verify your active connection and loyalty balance:
 npm run status    # verify active connection and loyalty points
 ```
 
-*(Optional: If you want tokens saved to disk instead of using environment variables, run `npm run login -- --save`)*
+*(Recommended: persist the session with `npm run login -- --save` and point `JUMBO_TOKENS_FILE` at a writable path — Jumbo rotates refresh tokens on every use, so the env value above is only a bootstrap fallback. Containers must mount a persistent volume; see [Persistent token storage](#persistent-token-storage-required-for-containers).)*
 
 ---
 
@@ -98,9 +98,14 @@ A multi-stage [`Dockerfile`](Dockerfile) is included for containerized environme
 ```bash
 # Build Docker image
 docker build -t jumbo-mcp .
+
+# One-time login on the host, into a directory you will mount
+docker run --rm -it -v jumbo-tokens:/data \
+  -e JUMBO_TOKENS_FILE=/data/tokens.json \
+  jumbo-mcp login --save
 ```
 
-Run with `JUMBO_REFRESH_TOKEN`:
+Run the server against the same volume:
 ```json
 {
   "mcpServers": {
@@ -110,6 +115,10 @@ Run with `JUMBO_REFRESH_TOKEN`:
         "run",
         "-i",
         "--rm",
+        "-v",
+        "jumbo-tokens:/data",
+        "-e",
+        "JUMBO_TOKENS_FILE=/data/tokens.json",
         "-e",
         "JUMBO_REFRESH_TOKEN=your_refresh_token_here",
         "jumbo-mcp"
@@ -118,6 +127,43 @@ Run with `JUMBO_REFRESH_TOKEN`:
   }
 }
 ```
+
+`-v jumbo-tokens:/data` is **not** optional — see below.
+
+### Persistent token storage (required for containers)
+
+Jumbo's Auth0 tenant issues **rotating refresh tokens**: every refresh returns a
+new refresh token and invalidates the previous one, with reuse detection. That
+makes the tokens file part of the credential, not a cache.
+
+* The server writes each rotated token to the file returned by
+  `JUMBO_TOKENS_FILE`. That path **must be on a persistent, writable volume** for
+  any container or headless deployment.
+* If the tokens file sits on the container's ephemeral layer, the rotated token
+  is lost on the next restart. The process then falls back to the stale
+  `JUMBO_REFRESH_TOKEN`, Auth0 sees a reused token, and the whole token family is
+  revoked — every tool call fails with
+  `Auth0 token refresh failed (403): {"error":"invalid_grant"}`.
+* **`JUMBO_REFRESH_TOKEN` alone is not safe with rotation enabled.** It is a
+  bootstrap value, read only when no tokens file exists; the token it produces
+  must still be persisted for the next start.
+* A tokens file that already carries a refresh token **always wins** over
+  `JUMBO_REFRESH_TOKEN`, so a stale env value can never overwrite a live session.
+* If the tokens path cannot be written, the server now fails the refresh loudly
+  (naming the path and this requirement) instead of continuing in memory.
+
+Recommended configuration:
+
+```bash
+JUMBO_TOKENS_FILE=/data/tokens.json   # on a mounted volume, writable by the container user
+JUMBO_REFRESH_TOKEN=...               # bootstrap only; ignored once tokens.json has a refresh token
+```
+
+**Recovery after an `invalid_grant`:** re-run `jumbo-mcp login --save` (or
+`docker run … jumbo-mcp login --save` against the same volume), set
+`JUMBO_REFRESH_TOKEN` to the new value if you keep one, and confirm
+`JUMBO_TOKENS_FILE` points at persistent storage. No retry can revive a token
+family Auth0 has already invalidated.
 
 ---
 

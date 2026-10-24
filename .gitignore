@@ -6,6 +6,9 @@ dist/
 .env
 *.env
 tokens.json
+tokens*.json
+*.tokens.json
+.tokens.*
 cookie.txt
 .pkce_session.json
 
