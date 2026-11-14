@@ -1,6 +1,6 @@
 {
   "name": "jumbo-mcp",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Model Context Protocol (MCP) server for Jumbo Supermarkten - Digital receipts, loyalty points, and grocery management",
   "main": "dist/index.js",
   "bin": {
@@ -14,7 +14,9 @@
   "scripts": {
     "build": "tsc && chmod +x dist/index.js",
     "start": "node dist/index.js",
+    "start:http": "node dist/index.js http",
     "dev": "tsx src/index.ts",
+    "dev:http": "tsx src/index.ts http",
     "test": "node --import tsx --test test/*.test.ts",
     "login": "tsx src/index.ts login",
     "status": "tsx src/index.ts status",
