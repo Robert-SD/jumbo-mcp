@@ -1,5 +1,36 @@
 # Jumbo MCP Server Release Notes
 
+## What's New in v0.6.0
+
+### 1. Persistent Streamable HTTP Server Mode
+* **Streamable HTTP Transport (`src/http.ts`)**: Added a persistent MCP Streamable HTTP server powered by `WebStandardStreamableHTTPServerTransport`, allowing remote MCP clients and multi-session workloads to share a single long-lived process and in-memory TTL cache.
+* **CLI & Script Entrypoints**: Start HTTP mode via `npm run start:http`, `npm run dev:http`, `node dist/index.js http`, `--transport http`, or `MCP_TRANSPORT=http`. Supports `--host`, `--port`, `--path`, and `--json` flags.
+* **Session Management & Health Endpoint**: Tracks per-session MCP server/transport instances with automatic idle session sweeping (`MCP_HTTP_SESSION_IDLE_MS`, default 30 minutes), graceful `SIGINT`/`SIGTERM` shutdown, and a `/healthz` endpoint reporting version, active session count, and cache stats.
+* **Security Controls**: Optional constant-time Bearer token authentication (`MCP_HTTP_AUTH_TOKEN`) and DNS rebinding protection via host/origin allowlists (`MCP_HTTP_ALLOWED_HOSTS`, `MCP_HTTP_ALLOWED_ORIGINS`).
+* **Dynamic Server Version**: `createServer()` now reads the server version dynamically from `package.json` instead of a hardcoded string.
+* **Test Coverage (`test/http.test.ts`)**: Added unit and integration tests covering session lifecycle, authentication, health checks, JSON response mode, and error handling.
+
+---
+
+## What's New in v0.5.0
+
+### 1. Robust Token Persistence & Auth0 Rotation Resilience
+* **Root Cause Fix**: Jumbo's Auth0 tenant rotates refresh tokens on every refresh with strict reuse detection. Ephemeral container filesystems could lose rotated tokens, causing fallback to stale bootstrap tokens and permanent token family revocation (`403 invalid_grant`).
+* **Pluggable Token Storage (`src/token-store.ts`)**: Extracted token loading and persistence into a dedicated module with a `TokenStore` interface and built-in `FileTokenStore`, `MemoryTokenStore`, and `HttpTokenStore` implementations.
+* **Atomic Writes & Safe Permissions**: Replaced direct overwrites with atomic temp-file writes (`renameSync`) and `0o600` permissions, plus `assertTokensPathWritable()` preflight checks before refreshing.
+
+### 2. Cross-Process Advisory File Locking & Concurrency Coalescing
+* **Advisory Locking**: `FileTokenStore` uses atomic `O_CREAT | O_EXCL` lockfiles (`.tokens.json.lock`) with PID/hostname/UUID ownership and stale lock breaking.
+* **Coalescing**: Both cross-process lock-wait coalescing and in-process single-flight deduping prevent concurrent refreshes from triggering token-reuse revocation.
+
+### 3. XDG Base Directory Standard Path Priority
+* Defaults new sessions to `~/.config/jumbo-mcp/tokens.json` while preserving existing legacy/project-root `tokens.json` files and explicit `JUMBO_TOKENS_FILE` overrides.
+
+### 4. Resilient HTTP Transport (`authFetch`)
+* 3-tier fallback chain (`globalThis.fetch` -> `node:https` -> system `curl`) with strict `AbortSignal` propagation across streaming responses and child processes.
+
+---
+
 ## What's New in v0.4.0
 
 ### 1. Response Cache with a Documented Freshness Policy

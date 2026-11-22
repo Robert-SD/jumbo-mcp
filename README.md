@@ -1,7 +1,7 @@
 # Jumbo MCP Server
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-0.4.0-green.svg)](https://modelcontextprotocol.io/)
+[![MCP](https://img.shields.io/badge/MCP-0.6.0-green.svg)](https://modelcontextprotocol.io/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg)](https://www.typescriptlang.org/)
 
 A Model Context Protocol (MCP) server for **Jumbo Supermarkten**.
@@ -44,7 +44,7 @@ Verify your active connection and loyalty balance:
 npm run status    # verify active connection and loyalty points
 ```
 
-*(Recommended: persist the session with `npm run login -- --save` and point `JUMBO_TOKENS_FILE` at a writable path — Jumbo rotates refresh tokens on every use, so the env value above is only a bootstrap fallback. Containers must mount a persistent volume; see [Persistent token storage](#persistent-token-storage-required-for-containers).)*
+*(Recommended: persist the session with `npm run login -- --save` and point `JUMBO_TOKENS_FILE` at a writable path. Jumbo rotates refresh tokens on every use, so the env value above is only a bootstrap fallback. Containers must mount a persistent volume; see [Persistent token storage](#persistent-token-storage-required-for-containers).)*
 
 ---
 
@@ -128,7 +128,25 @@ Run the server against the same volume:
 }
 ```
 
-`-v jumbo-tokens:/data` is **not** optional — see below.
+`-v jumbo-tokens:/data` is **not** optional (see below).
+
+### Method 4: Persistent Streamable HTTP Server
+Run the server as a persistent HTTP daemon (for remote MCP clients, multi-session use, or a shared in-memory cache):
+
+```bash
+npm run start:http
+# or with custom options:
+node dist/index.js http --host 127.0.0.1 --port 3000 --path /mcp
+```
+
+It exposes the MCP endpoint at `/mcp` and a health check at `/healthz`. You can also activate HTTP mode via `--transport http` or `MCP_TRANSPORT=http`.
+
+Optional environment variables:
+- `MCP_HTTP_HOST` (default `127.0.0.1`), `MCP_HTTP_PORT` / `PORT` (default `3000`), `MCP_HTTP_PATH` (default `/mcp`)
+- `MCP_HTTP_AUTH_TOKEN`: require `Authorization: Bearer <token>` on requests
+- `MCP_HTTP_SESSION_IDLE_MS`: idle session timeout in ms (default `1800000`, 30 minutes)
+- `MCP_HTTP_JSON_RESPONSE=true` (or `--json`): return JSON responses instead of SSE streams
+- `MCP_HTTP_ALLOWED_HOSTS` / `MCP_HTTP_ALLOWED_ORIGINS`: comma-separated allowlists enabling DNS rebinding protection
 
 ### Persistent token storage (required for containers)
 
@@ -142,7 +160,7 @@ makes the tokens file part of the credential, not a cache.
 * If the tokens file sits on the container's ephemeral layer, the rotated token
   is lost on the next restart. The process then falls back to the stale
   `JUMBO_REFRESH_TOKEN`, Auth0 sees a reused token, and the whole token family is
-  revoked — every tool call fails with
+  revoked, so every tool call fails with
   `Auth0 token refresh failed (403): {"error":"invalid_grant"}`.
 * **`JUMBO_REFRESH_TOKEN` alone is not safe with rotation enabled.** It is a
   bootstrap value, read only when no tokens file exists; the token it produces
@@ -198,12 +216,12 @@ family Auth0 has already invalidated.
 
 Jumbo's API cannot be cached at the HTTP layer, so this server keeps a
 **process-local TTL cache** in front of its single GraphQL choke point. It cuts
-request volume and speeds up repeat lookups — the promo digest alone resolves
-one receipt detail per receipt, plus a product lookup per basket term.
+request volume and speeds up repeat lookups (the promo digest alone resolves
+one receipt detail per receipt, plus a product lookup per basket term).
 
 **Scope:** in memory only, for the lifetime of the running MCP server process.
 Nothing is written to disk, no cache survives a restart, and entries are scoped
-to the signed-in account. No cached response contains your tokens — but a cached
+to the signed-in account. No cached response contains your tokens, but a cached
 receipt detail does carry that receipt's account data (customer ID and loyalty
 card number), which is why it never leaves process memory.
 
@@ -216,7 +234,7 @@ card number), which is why it never leaves process memory.
 | Product search results, promo search | 30 minutes | Offer prices churn daily |
 | Promotions and customer promotions | 30 minutes | Weekly campaign, daily markdowns |
 | Closed receipt line items, order deposits | 30 days | A closed receipt is immutable |
-| Everything else | — | See below |
+| Everything else | Never | See below |
 
 ### What is never cached
 
@@ -236,12 +254,10 @@ make the assistant re-add an item you just added.
   `JUMBO_MCP_CACHE_MAX_ENTRIES` caps the number of cached responses
   (default 500).
 * **Verify it:** call `jumbo_cache_stats` for the live hit/miss counters of the
-  running server — they cover both the GraphQL response cache and the city
+  running server; they cover both the GraphQL response cache and the city
   geocoding cache, so a store search that reused coordinates is visible. `npm run status` prints the cache *configuration* (enabled
-  state and size cap) — it starts a separate process, so it cannot show the
+  state and size cap) because it starts a separate process, so it cannot show the
   running server's counters.
-
----
 
 ---
 
@@ -270,7 +286,9 @@ make the assistant re-add an item you just added.
 
 | Command | Purpose |
 | :--- | :--- |
-| `npm run dev` | Run the server via `tsx` (development mode) |
+| `npm run dev` | Run the stdio server via `tsx` (development mode) |
+| `npm run dev:http` | Run the Streamable HTTP server via `tsx` |
+| `npm run start:http` | Run the compiled Streamable HTTP server |
 | `npm test` | Run the unit tests (mocked HTTP, no live Jumbo calls) |
 | `npm run login` | Authentication CLI wizard |
 | `npm run status` | Verify the live connection and token status |
